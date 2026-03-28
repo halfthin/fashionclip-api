@@ -1,0 +1,29 @@
+services:
+  fashionclip-api:
+    build: .
+    container_name: fashionclip-api
+    restart: always
+    env_file: .env.docker
+    ports:
+      - "${HOST_PORT:-8008}:8008"
+    volumes:
+      - /mnt/dapai-s:/mnt/dapai-s:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - web_net
+
+networks:
+  web_net:
+    external: true
