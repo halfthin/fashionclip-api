@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 from qdrant_client.http.exceptions import UnexpectedResponse
-from transformers import CLIPProcessor, CLIPModel
+import open_clip
 
 # 加载环境变量
 load_dotenv()
@@ -58,7 +58,7 @@ IMAGE_QUALITY = int(os.getenv("FASHIONCLIP_QUALITY", "q85"))  # JPEG 质量
 
 # ============ 全局状态 ============
 model = None
-processor = None
+preprocess = None
 qdrant_client = None
 scan_status = {
     "is_scanning": False,
@@ -86,22 +86,34 @@ app.add_middleware(
 
 # ============ 工具函数 ============
 def load_fashionclip_model():
-    """加载 FashionCLIP 模型"""
-    global model, processor
+    """加载 FashionCLIP 模型 (OpenCLIP 格式)"""
+    global model, preprocess
     if model is None:
         logger.info("正在加载 FashionCLIP 模型...")
-        model = CLIPModel.from_pretrained(
-            "laion/CLIP-ViT-B-16-laion2B-s34B-b88K",
-            cache_dir="/code/cache",
-        )
-        processor = CLIPProcessor.from_pretrained(
-            "laion/CLIP-ViT-B-16-laion2B-s34B-b88K",
-            cache_dir="/code/cache",
-        )
+        cache_dir = "/code/cache"
+        model_path = Path(cache_dir) / "models--laion--CLIP-ViT-B-16-laion2B-s34B-b88K" / "snapshots" / "default"
+        safetensors_path = model_path / "open_clip_model.safetensors"
+
+        if safetensors_path.exists():
+            # 从本地缓存加载 (通过 hf download 预下载)
+            logger.info(f"从本地加载 OpenCLIP 模型: {safetensors_path}")
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                model_name="ViT-B-16",
+                pretrained=None,
+                checkpoint_path=str(safetensors_path),
+            )
+        else:
+            # 直接从 HuggingFace 加载 (需联网)
+            logger.info("从 HuggingFace 加载模型...")
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                model_name="ViT-B-16",
+                pretrained="laion2B_s34B_b88K",
+            )
+
         model = model.to(DEVICE)
         model.eval()
         logger.info(f"FashionCLIP 模型加载完成，设备: {DEVICE}")
-    return model, processor
+    return model, preprocess
 
 
 def init_qdrant():
@@ -226,10 +238,10 @@ def resize_image_pil(img: Image.Image) -> Image.Image:
 
 def get_image_embedding(image: Image.Image) -> List[float]:
     """获取单张图片的 embedding 向量"""
-    m, p = load_fashionclip_model()
-    inputs = p(images=image, return_tensors="pt").to(DEVICE)
+    m, preprocess_fn = load_fashionclip_model()
     with torch.no_grad():
-        image_features = m.get_image_features(**inputs)
+        image = preprocess_fn(image).unsqueeze(0).to(DEVICE)
+        image_features = m.encode_image(image)
     # 归一化
     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
     return image_features.cpu().numpy()[0].tolist()

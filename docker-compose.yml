@@ -1,6 +1,6 @@
 services:
   fashionclip-api:
-    build: .
+    image: halfthin/fashionclip:latest
     container_name: fashionclip-api
     restart: always
     env_file: .env.docker
@@ -8,6 +8,7 @@ services:
       - "${HOST_PORT:-8008}:8008"
     volumes:
       - /mnt/dapai-s:/mnt/dapai-s:ro
+      - ./data/models:/code/cache
     deploy:
       resources:
         reservations:
