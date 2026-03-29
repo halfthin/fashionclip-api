@@ -1,12 +1,15 @@
 # FashionCLIP 图片相似度搜索 API 文档
 
-基于 FashionCLIP 模型 (laion/CLIP-ViT-B-16-laion2B-s34B-b88K) 的图片向量化和相似搜索服务。
+基于 FashionCLIP 模型的多模态图片分析和相似搜索服务。
 
 ## 基础信息
 
 - **服务地址**: `http://<host>:8008`
-- **向量维度**: 512 维
-- **模型**: CLIP ViT-B/16
+- **向量维度**: 512 维 (FashionCLIP)
+- **模型**:
+  - FashionCLIP: `laion/CLIP-ViT-B-16-laion2B-s34B-b88K` (512 维向量)
+  - YOLOv8n-cls: 图像分类 (ImageNet-1k)
+  - Segformer B0: 细粒度语义分割
 - **向量数据库**: Qdrant
 
 ## API 列表
@@ -15,6 +18,7 @@
 |------|------|------|
 | GET | `/health` | 健康检查 |
 | POST | `/search` | 搜索相似图片 |
+| POST | `/analyze` | 综合图片分析（向量+分类+属性） |
 | POST | `/embed/scan` | 触发目录扫描（异步） |
 | POST | `/embed/batch` | 批量 embedding |
 | GET | `/embed/status` | 获取扫描状态 |
@@ -99,7 +103,77 @@ curl -X POST http://localhost:8008/search \
 
 ---
 
-## 3. 触发目录扫描
+## 3. 综合图片分析
+
+综合分析图片，生成 FashionCLIP 向量和多维度分类标签，用于替代阿里百炼的 multimodal embedding。
+
+### 请求
+
+```
+POST /analyze
+Content-Type: multipart/form-data
+```
+
+**参数 (Form Data):**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `file` | File | 与 image_url 二选一 | 上传的图片文件 |
+| `image_url` | String | 与 file 二选一 | 图片 URL |
+
+### 示例
+
+```bash
+# 上传图片分析
+curl -X POST http://localhost:8008/analyze \
+  -F "file=@your_image.jpg"
+
+# URL 图片分析
+curl -X POST http://localhost:8008/analyze \
+  -F "image_url=https://example.com/image.jpg"
+```
+
+### 响应
+
+```json
+{
+  "embedding": [0.123, -0.456, ...],
+  "vector_size": 512,
+  "top_class": "jersey",
+  "yolo_labels": [
+    ["jersey", 0.8923],
+    ["cardigan", 0.0451],
+    ["sweatshirt", 0.0234],
+    ["bikini", 0.0123],
+    ["maillot", 0.0089]
+  ],
+  "detail_labels": [
+    [27, 0.1234],
+    [15, 0.0891],
+    [8, 0.0567],
+    [42, 0.0345],
+    [3, 0.0212]
+  ],
+  "combined_text": "jersey(0.89); cardigan(0.05); sweatshirt(0.02); 细粒度: segment_27, segment_15, segment_8, segment_42, segment_3",
+  "analyze_time_ms": 345.2
+}
+```
+
+**字段说明:**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `embedding` | float[512] | FashionCLIP 512 维归一化向量 |
+| `vector_size` | int | 向量维度 (512) |
+| `top_class` | string | YOLOv8n-cls 最高置信度分类 |
+| `yolo_labels` | array | YOLOv8n-cls top5 分类 [(类别名, 置信度), ...] |
+| `detail_labels` | array | Segformer B0 细粒度分割结果 [(类别索引, 比例), ...] |
+| `combined_text` | string | 合并后的文本描述 |
+| `analyze_time_ms` | float | 分析耗时 (毫秒) |
+
+---
+
+## 4. 触发目录扫描
 
 扫描照片目录，生成所有图片的向量并存入 Qdrant。
 
@@ -139,7 +213,7 @@ curl -X POST http://localhost:8008/embed/scan \
 
 ---
 
-## 4. 批量 Embedding
+## 5. 批量 Embedding
 
 将多个图片文件批量转换为向量并存储。
 
@@ -177,7 +251,7 @@ curl -X POST http://localhost:8008/embed/batch \
 
 ---
 
-## 5. 获取扫描状态
+## 6. 获取扫描状态
 
 ### 请求
 
@@ -208,7 +282,7 @@ curl http://localhost:8008/embed/status
 
 ---
 
-## 6. 获取图片向量信息
+## 7. 获取图片向量信息
 
 根据图片路径查询其向量信息和元数据。
 
@@ -362,5 +436,7 @@ except requests.exceptions.HTTPError as e:
 1. **图片格式**: 支持 JPEG、PNG 格式
 2. **图片大小**: 无明确限制，建议小于 10MB
 3. **Qdrant 连接**: 服务启动时必须能连接到 Qdrant，否则会退出
-4. **GPU**: 生产环境建议使用 GPU 加速推理
+4. **GPU**: 生产环境建议使用 GPU 加速推理（需要 `--gpus all`）
 5. **目录扫描**: `/embed/scan` 为异步操作，返回后扫描仍在后台继续
+6. **模型自动下载**: FashionCLIP 模型首次启动时自动从 HuggingFace 下载（使用 hf-mirror.com 镜像）
+7. **模型持久化**: 建议挂载 `./data/models:/code/cache` volume 避免重复下载

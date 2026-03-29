@@ -8,7 +8,8 @@ HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 mkdir -p "$CACHE_DIR"
 
 # 检测模型是否已缓存
-if ls "$HOME/.cache/huggingface/hub/models--${MODEL_NAME//\//--}/snapshots"/*/open_clip_model.safetensors >/dev/null 2>&1; then
+# open_clip 模型在 /code/cache/models--laion--.../snapshots/default/open_clip_model.safetensors
+if [ -f "$CACHE_DIR/models--${MODEL_NAME//\//--}/snapshots/default/open_clip_model.safetensors" ]; then
     echo "[fashionclip] Model found in cache"
 else
     echo "[fashionclip] Downloading model from HuggingFace..."

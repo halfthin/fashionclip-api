@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import torch
+import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -54,11 +55,14 @@ EXT_PRIORITY = {".png": 1, ".jpeg": 2, ".jpg": 3}
 # 使用 ffmpeg 预处理图片，可降低 FashionCLIP 处理负担
 ENABLE_IMAGE_RESIZE = os.getenv("FASHIONCLIP_RESIZE", "true").lower() == "true"
 IMAGE_MAX_DIMENSION = int(os.getenv("FASHIONCLIP_MAX_DIM", "672"))  # 672x672 (CLIP 常用输入)
-IMAGE_QUALITY = int(os.getenv("FASHIONCLIP_QUALITY", "q85"))  # JPEG 质量
+IMAGE_QUALITY = int(os.getenv("FASHIONCLIP_QUALITY", "85"))  # JPEG 质量
 
 # ============ 全局状态 ============
 model = None
 preprocess = None
+yolo_model = None
+segformer_model = None
+segformer_processor = None
 qdrant_client = None
 scan_status = {
     "is_scanning": False,
@@ -114,6 +118,144 @@ def load_fashionclip_model():
         model.eval()
         logger.info(f"FashionCLIP 模型加载完成，设备: {DEVICE}")
     return model, preprocess
+
+
+def load_yolo_model():
+    """加载 YOLOv8n-cls 模型"""
+    global yolo_model
+    if yolo_model is None:
+        from ultralytics import YOLO
+        logger.info("正在加载 YOLOv8n-cls 模型...")
+        yolo_model = YOLO("yolov8n-cls.pt")
+        if DEVICE == "cuda":
+            yolo_model.to(DEVICE)
+        logger.info("YOLOv8n-cls 模型加载完成")
+    return yolo_model
+
+
+def classify_with_yolo(image: Image.Image) -> dict:
+    """
+    使用 YOLOv8n-cls 识别图像主体
+    返回: {"top_class": str, "labels": [(label, confidence), ...]}
+    """
+    m = load_yolo_model()
+    # YOLO 需要 numpy array 或图像路径
+    img_array = np.array(image.convert("RGB"))
+    results = m.predict(img_array, verbose=False)
+    probs = results[0].probs
+    top5_indices = probs.top5
+    top5_conf = probs.top5_conf
+
+    labels = []
+    for idx, conf in zip(top5_indices, top5_conf):
+        labels.append((results[0].names[idx], float(conf)))
+
+    return {
+        "top_class": labels[0][0] if labels else None,
+        "labels": labels,
+    }
+
+
+def load_segformer_model():
+    """加载 Segformer B0 模型"""
+    global segformer_model, segformer_processor
+    if segformer_model is None:
+        from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
+        logger.info("正在加载 Segformer B0 模型...")
+        segformer_processor = AutoImageProcessor.from_pretrained(
+            "nvidia/mit-b0",
+            cache_dir="/code/cache",
+        )
+        segformer_model = AutoModelForSemanticSegmentation.from_pretrained(
+            "nvidia/mit-b0",
+            cache_dir="/code/cache",
+        )
+        segformer_model.to(DEVICE)
+        segformer_model.eval()
+        logger.info("Segformer B0 模型加载完成")
+    return segformer_model, segformer_processor
+
+
+CLOTHING_DETAIL_KEYWORDS = [
+    "collar", "lapel", "neckline", "sleeve", "cuff", "button", "zipper",
+    "pocket", "hem", "seam", "fabric", "texture", "pattern", "embroidery",
+    "knit", "weave", "lace", "fringe", "ruffle", "pleat", "pleats",
+]
+
+
+def classify_with_segformer(image: Image.Image) -> dict:
+    """
+    使用 Segformer B0 进行细粒度服装属性识别
+    返回: {"segments": [(label, confidence), ...], "detail_text": str}
+    """
+    m, processor = load_segformer_model()
+    img = image.convert("RGB")
+    inputs = processor(images=img, return_tensors="pt").to(DEVICE)
+
+    with torch.no_grad():
+        outputs = m(**inputs)
+        logits = outputs.logits  # [1, 150, H, W]
+
+    # 取最大激活的类别
+    seg_map = logits.argmax(dim=1)[0].cpu().numpy()
+    unique, counts = np.unique(seg_map, return_counts=True)
+
+    # 获取类别标签 (需要了解 MIT-B0 的类别映射，这里使用索引)
+    # Segformer MIT-B0 有 150 个 Cityscapes 类别
+    # 我们提取高频区域作为 detail
+    sorted_segments = sorted(zip(counts, unique), reverse=True)[:10]
+    segments = [(int(cls), float(cnt / seg_map.size)) for cnt, cls in sorted_segments]
+
+    # 生成描述文本
+    detail_parts = []
+    for cls_idx, ratio in sorted_segments[:5]:
+        detail_parts.append(f"segment_{cls_idx}")
+
+    detail_text = ", ".join(detail_parts) if detail_parts else "unknown"
+
+    return {
+        "segments": segments,
+        "detail_text": detail_text,
+    }
+
+
+def analyze_image(image: Image.Image) -> dict:
+    """
+    综合分析图片: FashionCLIP embedding + YOLOv8 分类 + Segformer 细粒度识别
+    """
+    # 1. 获取 FashionCLIP embedding
+    embedding = get_image_embedding(image)
+
+    # 2. YOLOv8n-cls 分类
+    yolo_result = classify_with_yolo(image)
+    top_class = yolo_result["top_class"]
+
+    # 3. 如果是服装相关的细分类，使用 Segformer 进一步分析
+    detail_result = {}
+    if top_class and any(k in str(top_class).lower() for k in ["shirt", "dress", "coat", "jacket", "sweater", "top", "pants", "clothing", "garment"]):
+        try:
+            detail_result = classify_with_segformer(image)
+        except Exception as e:
+            logger.warning(f"Segformer 识别失败: {e}")
+            detail_result = {"detail_text": "", "segments": []}
+
+    # 4. 合并文本描述
+    descriptions = []
+    for label, conf in yolo_result["labels"][:3]:
+        descriptions.append(f"{label}({conf:.2f})")
+    if detail_result.get("detail_text"):
+        descriptions.append(f"细粒度: {detail_result['detail_text']}")
+
+    combined_text = "; ".join(descriptions)
+
+    return {
+        "embedding": embedding,
+        "vector_size": len(embedding),
+        "top_class": top_class,
+        "yolo_labels": yolo_result["labels"][:5],
+        "detail_labels": detail_result.get("segments", [])[:5],
+        "combined_text": combined_text,
+    }
 
 
 def init_qdrant():
@@ -423,6 +565,56 @@ async def search_similar(
         "total": len(search_results),
         "query_time_ms": query_time_ms,
     }
+
+
+@app.post("/analyze")
+async def analyze_image_api(
+    file: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
+):
+    """
+    综合图片分析 (用于替代阿里百炼)
+
+    返回:
+    - embedding: FashionCLIP 512 维向量
+    - top_class: YOLOv8n-cls 识别的最高置信度类别
+    - yolo_labels: YOLOv8n-cls top5 分类结果
+    - detail_labels: Segformer B0 细粒度分割结果
+    - combined_text: 合并后的文本描述
+    """
+    start_time = time.time()
+
+    if file:
+        try:
+            contents = await file.read()
+            raw_image = Image.open(io.BytesIO(contents)).convert("RGB")
+            query_image = resize_image_pil(raw_image)
+            raw_image.close()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"无法解析图片: {str(e)}")
+    elif image_url:
+        try:
+            import urllib.request
+            with urllib.request.urlopen(image_url, timeout=10) as response:
+                contents = response.read()
+            raw_image = Image.open(io.BytesIO(contents)).convert("RGB")
+            query_image = resize_image_pil(raw_image)
+            raw_image.close()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"无法下载图片: {str(e)}")
+    else:
+        raise HTTPException(status_code=400, detail="必须提供 file 或 image_url")
+
+    try:
+        result = analyze_image(query_image)
+    except Exception as e:
+        logger.error(f"图片分析失败: {e}")
+        raise HTTPException(status_code=500, detail=f"分析失败: {str(e)}")
+    finally:
+        query_image.close()
+
+    result["analyze_time_ms"] = round((time.time() - start_time) * 1000)
+    return result
 
 
 @app.post("/embed/scan")
