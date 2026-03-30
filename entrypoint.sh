@@ -7,10 +7,10 @@ HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
 mkdir -p "$CACHE_DIR"
 
-# 检测模型是否已缓存
-# open_clip 模型在 /code/cache/models--laion--.../snapshots/default/open_clip_model.safetensors
-if [ -f "$CACHE_DIR/models--${MODEL_NAME//\//--}/snapshots/default/open_clip_model.safetensors" ]; then
-    echo "[fashionclip] Model found in cache"
+# 检测模型是否已缓存（检查任一快照目录下的模型文件）
+MODEL_DIR="$CACHE_DIR/models/models--${MODEL_NAME//\//--}"
+if [ -d "$MODEL_DIR/snapshots" ] && find "$MODEL_DIR/snapshots" -name "open_clip_model.safetensors" -type f 2>/dev/null | grep -q .; then
+    echo "[fashionclip] Model found in cache at $MODEL_DIR"
 else
     echo "[fashionclip] Downloading model from HuggingFace..."
     hf download "$MODEL_NAME" --cache-dir "$CACHE_DIR" --quiet || true

@@ -92,23 +92,29 @@ def load_fashionclip_model():
     if model is None:
         logger.info("正在加载 FashionCLIP 模型...")
         cache_dir = "/code/cache"
-        model_path = Path(cache_dir) / "models--laion--CLIP-ViT-B-16-laion2B-s34B-b88K" / "snapshots" / "default"
-        safetensors_path = model_path / "open_clip_model.safetensors"
+        model_base = Path(cache_dir) / "models--laion--CLIP-ViT-B-16-laion2B-s34B-b88K" / "snapshots"
 
-        if safetensors_path.exists():
-            # 从本地缓存加载 (通过 hf download 预下载)
+        # 查找实际的快照目录
+        safetensors_path = None
+        for snap_dir in model_base.iterdir():
+            if snap_dir.is_dir():
+                candidate = snap_dir / "open_clip_model.safetensors"
+                if candidate.exists():
+                    safetensors_path = candidate
+                    break
+
+        if safetensors_path and safetensors_path.exists():
+            # 从本地缓存加载
             logger.info(f"从本地加载 OpenCLIP 模型: {safetensors_path}")
             model, _, preprocess = open_clip.create_model_and_transforms(
                 model_name="ViT-B-16",
-                pretrained=None,
-                checkpoint_path=str(safetensors_path),
+                pretrained=str(safetensors_path),
             )
         else:
             # 直接从 HuggingFace 加载 (需联网)
             logger.info("从 HuggingFace 加载模型...")
             model, _, preprocess = open_clip.create_model_and_transforms(
-                model_name="ViT-B-16",
-                pretrained="laion2B_s34B_b88K",
+                model_name="laion/CLIP-ViT-B-16-laion2B-s34B-b88K",
             )
 
         model = model.to(DEVICE)
