@@ -19,6 +19,7 @@
 | GET | `/health` | 健康检查 |
 | POST | `/search` | 搜索相似图片 |
 | POST | `/analyze` | 综合图片分析（向量+分类+属性） |
+| POST | `/analyze/product` | 款式分析（支持文件夹/URL/Base64） |
 | POST | `/embed/scan` | 触发目录扫描（异步） |
 | POST | `/embed/batch` | 批量 embedding |
 | GET | `/embed/status` | 获取扫描状态 |
@@ -173,7 +174,81 @@ curl -X POST http://localhost:8008/analyze \
 
 ---
 
-## 4. 触发目录扫描
+## 4. 款式分析
+
+款式分析接口，支持多种图片输入格式，返回结构化的款式信息。
+
+### 请求
+
+```
+POST /analyze/product
+Content-Type: application/x-www-form-urlencoded
+```
+
+**参数 (Form Data):**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `folder_path` | String | 与其他图片参数二选一 | 文件夹路径，扫描目录下所有图片 |
+| `image_urls` | String | 与其他图片参数二选一 | 图片 URL，多个用逗号分隔 |
+| `image_paths` | String | 与其他图片参数二选一 | 本地图片路径，多个用逗号分隔 |
+| `images_base64` | String | 与其他图片参数二选一 | Base64 图片，格式: `[{"Name":"xxx.jpg","data":"base64..."},...]` |
+
+### 示例
+
+```bash
+# 从文件夹分析
+curl -X POST http://localhost:8008/analyze/product \
+  -d "folder_path=/mnt/dapai-s/category/2024A001"
+
+# 从 URL 分析
+curl -X POST http://localhost:8008/analyze/product \
+  -d "image_urls=https://example.com/img1.jpg,https://example.com/img2.jpg"
+
+# 从本地路径分析
+curl -X POST http://localhost:8008/analyze/product \
+  -d "image_paths=/mnt/dapai-s/category/2024A001/main.jpg,/mnt/dapai-s/category/2024A001/detail1.jpg"
+```
+
+### 响应
+
+```json
+{
+  "prod_code": "2024A001",
+  "summary": "浅蓝色，牛仔裤，街头风，牛角扣，碎边 (2张图片)",
+  "detail": [
+    {
+      "filepath": "/mnt/dapai-s/category/2024A001/main.jpg",
+      "text": "jersey(0.89); 细粒度: segment_27, segment_15",
+      "top_class": "jersey"
+    },
+    {
+      "filepath": "/mnt/dapai-s/category/2024A001/detail1.jpg",
+      "text": "jersey(0.85); collar(0.12); 细粒度: segment_8",
+      "top_class": "jersey"
+    }
+  ],
+  "total_images": 2,
+  "process_time_ms": 1234.5
+}
+```
+
+**字段说明:**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `prod_code` | string | 从文件路径中提取的款号，可能为空 |
+| `summary` | string | 所有图片识别的汇总描述 |
+| `detail` | array | 每张图片的详细识别结果 |
+| `detail[].filepath` | string | 图片路径或名称 |
+| `detail[].text` | string | 该图片的识别文本描述 |
+| `detail[].top_class` | string | 该图片的 YOLOv8 最高置信度分类 |
+| `total_images` | int | 处理的图片总数 |
+| `process_time_ms` | float | 处理耗时 (毫秒) |
+
+---
+
+## 5. 触发目录扫描
 
 扫描照片目录，生成所有图片的向量并存入 Qdrant。
 
@@ -213,7 +288,7 @@ curl -X POST http://localhost:8008/embed/scan \
 
 ---
 
-## 5. 批量 Embedding
+## 6. 批量 Embedding
 
 将多个图片文件批量转换为向量并存储。
 
@@ -251,7 +326,7 @@ curl -X POST http://localhost:8008/embed/batch \
 
 ---
 
-## 6. 获取扫描状态
+## 7. 获取扫描状态
 
 ### 请求
 
@@ -282,7 +357,7 @@ curl http://localhost:8008/embed/status
 
 ---
 
-## 7. 获取图片向量信息
+## 8. 获取图片向量信息
 
 根据图片路径查询其向量信息和元数据。
 

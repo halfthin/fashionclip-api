@@ -617,6 +617,242 @@ async def analyze_image_api(
     return result
 
 
+def extract_prod_code(path: str) -> str:
+    """从文件路径中提取款号"""
+    import re
+    # 常见款号格式: 款号, code, NO., N-, 数字等
+    patterns = [
+        r'款号[：:]\s*([A-Za-z0-9\-_]+)',
+        r'code[：:]\s*([A-Za-z0-9\-_]+)',
+        r'NO\.?\s*([A-Za-z0-9\-_]+)',
+        r'(?:^|[/\-_])([0-9]{4,}[A-Za-z0-9\-_]*)',
+        r'(?<=[/\-_])([A-Za-z]+[0-9]+[A-Za-z0-9\-_]*)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, path, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+@app.post("/analyze/product")
+async def analyze_product(
+    folder_path: Optional[str] = Form(None),
+    image_urls: Optional[str] = Form(None),
+    image_paths: Optional[str] = Form(None),
+    images_base64: Optional[str] = Form(None),
+):
+    """
+    款式分析接口 - 支持多种图片输入格式
+
+    输入参数 (至少需要一种):
+    - folder_path: 文件夹路径，扫描文件夹下所有图片
+    - image_urls: 图片 URL，多个用逗号分隔
+    - image_paths: 本地图片路径，多个用逗号分隔
+    - images_base64: Base64 编码的图片，格式: [{"name": "xxx.jpg", "data": "base64..."}, ...]
+
+    返回:
+    - prod_code: 提取的款号
+    - summary: 所有图片识别的汇总
+    - detail: 每张图片的详细识别结果
+    """
+    start_time = time.time()
+    import json
+    import base64 as b64
+
+    image_sources = []  # [(source_type, source_info, filepath_display)]
+
+    # 1. 处理文件夹路径
+    if folder_path:
+        folder = Path(folder_path)
+        if not folder.exists() or not folder.is_dir():
+            raise HTTPException(status_code=400, detail=f"文件夹不存在或不是目录: {folder_path}")
+        for ext in ALLOWED_EXTENSIONS:
+            for img_path in folder.rglob(f"*{ext}"):
+                # 跳过缩略图等
+                if any(skip in img_path.name.lower() for skip in SKIP_SUBSTRINGS):
+                    continue
+                image_sources.append(("path", str(img_path), str(img_path)))
+
+    # 2. 处理图片 URL
+    if image_urls:
+        for url in image_urls.split(","):
+            url = url.strip()
+            if url:
+                image_sources.append(("url", url, url))
+
+    # 3. 处理本地图片路径
+    if image_paths:
+        for path_str in image_paths.split(","):
+            path_str = path_str.strip()
+            if path_str:
+                p = Path(path_str)
+                if not p.exists():
+                    logger.warning(f"图片路径不存在，跳过: {path_str}")
+                    continue
+                image_sources.append(("path", str(p), str(p)))
+
+    # 4. 处理 Base64 图片
+    if images_base64:
+        try:
+            b64_images = json.loads(images_base64)
+            for idx, item in enumerate(b64_images):
+                name = item.get("name", f"base64_{idx}.jpg")
+                data = item.get("data", "")
+                image_sources.append(("base64", data, name))
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="images_base64 格式错误，应为 JSON 数组")
+
+    if not image_sources:
+        raise HTTPException(status_code=400, detail="至少需要提供一种图片来源")
+
+    # 限制数量
+    MAX_IMAGES = 50
+    if len(image_sources) > MAX_IMAGES:
+        raise HTTPException(status_code=400, detail=f"图片数量超过限制，最多 {MAX_IMAGES} 张")
+
+    # 5. 逐个分析图片
+    details = []
+    all_classes = []
+    all_texts = []
+
+    for source_type, source_info, filepath in image_sources:
+        try:
+            if source_type == "path":
+                raw_image = Image.open(source_info).convert("RGB")
+                image = resize_image_pil(raw_image)
+                raw_image.close()
+            elif source_type == "url":
+                import urllib.request
+                with urllib.request.urlopen(source_info, timeout=10) as response:
+                    contents = response.read()
+                raw_image = Image.open(io.BytesIO(contents)).convert("RGB")
+                image = resize_image_pil(raw_image)
+                raw_image.close()
+            elif source_type == "base64":
+                decoded = b64.b64decode(source_info)
+                raw_image = Image.open(io.BytesIO(decoded)).convert("RGB")
+                image = resize_image_pil(raw_image)
+                raw_image.close()
+            else:
+                continue
+
+            result = analyze_image(image)
+            image.close()
+
+            details.append({
+                "filepath": filepath,
+                "text": result["combined_text"],
+                "top_class": result["top_class"],
+            })
+            if result["top_class"]:
+                all_classes.append(result["top_class"])
+            all_texts.append(result["combined_text"])
+
+        except Exception as e:
+            logger.error(f"分析图片失败 {filepath}: {e}")
+            details.append({
+                "filepath": filepath,
+                "text": f"[识别失败: {str(e)}]",
+                "top_class": None,
+            })
+
+    # 6. 提取款号 (从第一个本地路径中提取)
+    prod_code = ""
+    for src in image_sources:
+        if src[0] == "path":
+            prod_code = extract_prod_code(src[1])
+            if prod_code:
+                break
+
+    # 7. 生成汇总 - 将多张图片识别结果合并为产品描述
+    summary = generate_product_summary(details, all_classes)
+
+    total_time = round((time.time() - start_time) * 1000)
+
+    return {
+        "prod_code": prod_code,
+        "summary": summary,
+        "detail": details,
+        "total_images": len(details),
+        "process_time_ms": total_time,
+    }
+
+
+def generate_product_summary(details: list, all_classes: list) -> str:
+    """从识别结果生成产品描述"""
+    from collections import Counter
+    import re
+
+    if not details:
+        return "未识别到有效结果"
+
+    # 收集所有标签
+    all_labels = []
+    for d in details:
+        text = d.get("text", "")
+        parts = re.split(r'[;，,]', text)
+        for part in parts:
+            label = re.sub(r'\([\d.]+\)', '', part).strip()
+            if label and not label.startswith("[") and "细粒度" not in label:
+                all_labels.append(label.lower())
+
+    color_keywords = [
+        "white", "black", "red", "blue", "green", "yellow", "pink", "purple", "orange", "gray", "grey",
+        "brown", "navy", "beige", "cream", "khaki", "burgundy", "maroon", "olive", "mint",
+        "白色", "黑色", "红色", "蓝色", "绿色", "黄色", "粉色", "紫色", "橙色", "灰色", "棕色",
+        "藏青色", "米色", "卡其", "酒红色", "墨绿色", "薄荷绿", "浅蓝", "深蓝", "浅色", "深色"
+    ]
+    category_keywords = [
+        "jersey", "sweater", "cardigan", "hoodie", "coat", "jacket", "pants", "jeans", "skirt",
+        "dress", "shirt", "blouse", "top", "t-shirt", "polo", "vest", "sweatshirt",
+        "毛衣", "针织衫", "开衫", "卫衣", "外套", "夹克", "裤子", "牛仔裤", "裙子",
+        "连衣裙", "衬衫", "上衣", "T恤", "马甲", "运动衫"
+    ]
+    style_keywords = [
+        "casual", "street", "sport", "formal", "vintage", "fashion", "hip", "punk", "rock",
+        "街头", "运动", "休闲", "正式", "复古", "时尚", "朋克", "摇滚", "韩风", "日系", "欧美"
+    ]
+    detail_keywords = [
+        "collar", "lapel", "pocket", "button", "zipper", "hood", "sleeve", "cuff", "hem",
+        "round", "v-neck", "crew", "polo", "detachable", "lined", "padded",
+        "领子", "翻领", "口袋", "纽扣", "拉链", "帽子", "袖子", "袖口", "下摆",
+        "圆领", "V领", "立领", "可拆卸", "加绒", "加厚", "绗缝", "拼接", "渐变",
+        "牛角扣", "金属扣", "木扣", "撞色", "压褶", "打孔", "毛边", "破洞", "洗旧", "磨白"
+    ]
+    pattern_keywords = [
+        "stripe", "plaid", "pattern", "solid", "print", "embroidery", "lace", "knit",
+        "条纹", "格纹", "图案", "纯色", "印花", "刺绣", "蕾丝", "针织", "碎花", "波点", "豹纹",
+        "animal", "floral", "geometric", "letter", "logo"
+    ]
+
+    keyword_groups = [
+        color_keywords, category_keywords, style_keywords, detail_keywords, pattern_keywords
+    ]
+
+    summary_parts = []
+    found_categories = set()
+
+    for keywords in keyword_groups:
+        for label in all_labels:
+            for kw in keywords:
+                if kw.lower() in label.lower():
+                    if kw not in found_categories:
+                        summary_parts.append(kw)
+                        found_categories.add(kw)
+                        break
+
+    if not summary_parts and all_classes:
+        class_counts = Counter(all_classes)
+        top_class = class_counts.most_common(1)[0][0] if class_counts else ""
+        summary_parts.append(top_class)
+
+    summary = "，".join(summary_parts) if summary_parts else "未识别到有效结果"
+    summary += f" ({len(details)}张图片)"
+
+    return summary
+
+
 @app.post("/embed/scan")
 async def trigger_scan(force_refresh: bool = Form(False)):
     """
