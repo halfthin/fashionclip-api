@@ -620,13 +620,14 @@ async def analyze_image_api(
 def extract_prod_code(path: str) -> str:
     """从文件路径中提取款号"""
     import re
-    # 常见款号格式: 款号, code, NO., N-, 数字等
+    # 款号格式: 款号, code, NO., 数字+字母, 或 N.CODE@ 格式
     patterns = [
         r'款号[：:]\s*([A-Za-z0-9\-_]+)',
         r'code[：:]\s*([A-Za-z0-9\-_]+)',
         r'NO\.?\s*([A-Za-z0-9\-_]+)',
-        r'(?:^|[/\-_])([0-9]{4,}[A-Za-z0-9\-_]*)',
-        r'(?<=[/\-_])([A-Za-z]+[0-9]+[A-Za-z0-9\-_]*)',
+        r'(?:^|[/\-_])([A-Za-z]+\d{5,}[A-Za-z0-9\-_]*)',  # K8610345 格式
+        r'(?<=[/\-_.])([A-Za-z]+\d{4,}[A-Za-z0-9\-_]*)(?=@)',  # N.CODE@ 格式
+        r'(?:^|[/\-_])([0-9]{4,}[A-Za-z0-9\-_]*)',  # 开头的数字款号
     ]
     for pattern in patterns:
         match = re.search(pattern, path, re.IGNORECASE)
@@ -787,61 +788,67 @@ def generate_product_summary(details: list, all_classes: list) -> str:
     if not details:
         return "未识别到有效结果"
 
-    # 收集所有标签
+    # 收集所有标签（只取 YOLO 类别名部分）
     all_labels = []
     for d in details:
         text = d.get("text", "")
+        # 分割并提取类别名（不含细粒度部分）
         parts = re.split(r'[;，,]', text)
         for part in parts:
+            part = part.strip()
+            if "细粒度" in part or part.startswith("segment_"):
+                continue
             label = re.sub(r'\([\d.]+\)', '', part).strip()
-            if label and not label.startswith("[") and "细粒度" not in label:
+            if label and not label.startswith("["):
                 all_labels.append(label.lower())
 
+    # YOLO 类别到中文描述的映射（处理复合词）
+    yolo_category_map = {
+        # 上装
+        "fur_coat": "毛皮外套", "trench_coat": "风衣", "lab_coat": "实验服",
+        "jersey": "运动衫", "sweatshirt": "运动衫", "cardigan": "开衫",
+        "hoodie": "卫衣", "sweater": "毛衣", "blouse": "衬衫",
+        "shirt": "衬衫", "polo": "POLO衫", "vest": "马甲",
+        "t-shirt": "T恤", "suit": "西装", "military_uniform": "军装",
+        "gasmask": "防毒面具", "breastplate": "护胸", "cuirass": "护甲",
+        # 下装
+        "jean": "牛仔裤", "pants": "裤子",
+        # 配饰
+        "cowboy_hat": "牛仔帽", "punching_bag": "沙袋",
+    }
+
+    # 通用关键词列表（用于直接从标签中提取）
     color_keywords = [
         "white", "black", "red", "blue", "green", "yellow", "pink", "purple", "orange", "gray", "grey",
         "brown", "navy", "beige", "cream", "khaki", "burgundy", "maroon", "olive", "mint",
-        "白色", "黑色", "红色", "蓝色", "绿色", "黄色", "粉色", "紫色", "橙色", "灰色", "棕色",
-        "藏青色", "米色", "卡其", "酒红色", "墨绿色", "薄荷绿", "浅蓝", "深蓝", "浅色", "深色"
-    ]
-    category_keywords = [
-        "jersey", "sweater", "cardigan", "hoodie", "coat", "jacket", "pants", "jeans", "skirt",
-        "dress", "shirt", "blouse", "top", "t-shirt", "polo", "vest", "sweatshirt",
-        "毛衣", "针织衫", "开衫", "卫衣", "外套", "夹克", "裤子", "牛仔裤", "裙子",
-        "连衣裙", "衬衫", "上衣", "T恤", "马甲", "运动衫"
-    ]
-    style_keywords = [
-        "casual", "street", "sport", "formal", "vintage", "fashion", "hip", "punk", "rock",
-        "街头", "运动", "休闲", "正式", "复古", "时尚", "朋克", "摇滚", "韩风", "日系", "欧美"
     ]
     detail_keywords = [
         "collar", "lapel", "pocket", "button", "zipper", "hood", "sleeve", "cuff", "hem",
-        "round", "v-neck", "crew", "polo", "detachable", "lined", "padded",
-        "领子", "翻领", "口袋", "纽扣", "拉链", "帽子", "袖子", "袖口", "下摆",
-        "圆领", "V领", "立领", "可拆卸", "加绒", "加厚", "绗缝", "拼接", "渐变",
-        "牛角扣", "金属扣", "木扣", "撞色", "压褶", "打孔", "毛边", "破洞", "洗旧", "磨白"
-    ]
-    pattern_keywords = [
+        "round", "v-neck", "crew", "detachable", "lined", "padded",
+        "牛角扣", "金属扣", "木扣", "撞色", "压褶", "毛边", "破洞",
         "stripe", "plaid", "pattern", "solid", "print", "embroidery", "lace", "knit",
-        "条纹", "格纹", "图案", "纯色", "印花", "刺绣", "蕾丝", "针织", "碎花", "波点", "豹纹",
-        "animal", "floral", "geometric", "letter", "logo"
-    ]
-
-    keyword_groups = [
-        color_keywords, category_keywords, style_keywords, detail_keywords, pattern_keywords
     ]
 
     summary_parts = []
     found_categories = set()
 
-    for keywords in keyword_groups:
-        for label in all_labels:
-            for kw in keywords:
-                if kw.lower() in label.lower():
+    # 第一步：使用映射表转换 YOLO 类别
+    for label in all_labels:
+        if label in yolo_category_map:
+            chinese = yolo_category_map[label]
+            if chinese not in found_categories:
+                summary_parts.append(chinese)
+                found_categories.add(chinese)
+        else:
+            # 第二步：直接从标签提取颜色和细节关键词
+            for kw in color_keywords + detail_keywords:
+                if kw.lower() in label:
                     if kw not in found_categories:
                         summary_parts.append(kw)
                         found_categories.add(kw)
-                        break
+                    break
 
+    # 第三步：如果什么都没提取到，使用最常见的类别
     if not summary_parts and all_classes:
         class_counts = Counter(all_classes)
         top_class = class_counts.most_common(1)[0][0] if class_counts else ""
