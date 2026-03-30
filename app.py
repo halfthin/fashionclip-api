@@ -144,7 +144,7 @@ def classify_with_yolo(image: Image.Image) -> dict:
     results = m.predict(img_array, verbose=False)
     probs = results[0].probs
     top5_indices = probs.top5
-    top5_conf = probs.top5_conf
+    top5_conf = probs.top5conf
 
     labels = []
     for idx, conf in zip(top5_indices, top5_conf):
