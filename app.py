@@ -219,9 +219,13 @@ def classify_with_segformer(image: Image.Image) -> dict:
     }
 
 
-def analyze_image(image: Image.Image) -> dict:
+def analyze_image(image: Image.Image, use_segformer: bool = False) -> dict:
     """
-    综合分析图片: FashionCLIP embedding + YOLOv8 分类 + Segformer 细粒度识别
+    综合分析图片: FashionCLIP embedding + YOLOv8 分类 + (可选) Segformer 细粒度识别
+
+    Args:
+        image: PIL Image 对象
+        use_segformer: 是否使用 Segformer 进行细粒度识别，默认关闭
     """
     # 1. 获取 FashionCLIP embedding
     embedding = get_image_embedding(image)
@@ -230,9 +234,9 @@ def analyze_image(image: Image.Image) -> dict:
     yolo_result = classify_with_yolo(image)
     top_class = yolo_result["top_class"]
 
-    # 3. 如果是服装相关的细分类，使用 Segformer 进一步分析
+    # 3. Segformer 细粒度识别（仅在 use_segformer=True 且是服装类时调用）
     detail_result = {}
-    if top_class and any(k in str(top_class).lower() for k in ["shirt", "dress", "coat", "jacket", "sweater", "top", "pants", "clothing", "garment"]):
+    if use_segformer and top_class and any(k in str(top_class).lower() for k in ["shirt", "dress", "coat", "jacket", "sweater", "top", "pants", "clothing", "garment", "jersey", "hoodie", "cardigan", "sweatshirt", "blouse", "polo", "vest"]):
         try:
             detail_result = classify_with_segformer(image)
         except Exception as e:
@@ -713,6 +717,12 @@ async def analyze_product(
         raise HTTPException(status_code=400, detail=f"图片数量超过限制，最多 {MAX_IMAGES} 张")
 
     # 5. 逐个分析图片
+    # 判断是否使用 Segformer（仅细目/细节目录启用）
+    use_segformer = False
+    if folder_path and "细节" in folder_path:
+        use_segformer = True
+        logger.info(f"细目目录检测到，启用 Segformer B0 细粒度识别")
+
     details = []
     all_classes = []
     all_texts = []
@@ -738,7 +748,7 @@ async def analyze_product(
             else:
                 continue
 
-            result = analyze_image(image)
+            result = analyze_image(image, use_segformer=use_segformer)
             image.close()
 
             details.append({
@@ -802,19 +812,36 @@ def generate_product_summary(details: list, all_classes: list) -> str:
             if label and not label.startswith("["):
                 all_labels.append(label.lower())
 
-    # YOLO 类别到中文描述的映射（处理复合词）
+    # YOLO 类别到中文描述的映射（只保留服装、鞋帽相关）
+    # ImageNet 中服装相关的类别映射
     yolo_category_map = {
         # 上装
-        "fur_coat": "毛皮外套", "trench_coat": "风衣", "lab_coat": "实验服",
+        "fur_coat": "毛皮外套", "trench_coat": "风衣",
         "jersey": "运动衫", "sweatshirt": "运动衫", "cardigan": "开衫",
         "hoodie": "卫衣", "sweater": "毛衣", "blouse": "衬衫",
         "shirt": "衬衫", "polo": "POLO衫", "vest": "马甲",
-        "t-shirt": "T恤", "suit": "西装", "military_uniform": "军装",
-        "gasmask": "防毒面具", "breastplate": "护胸", "cuirass": "护甲",
+        "t-shirt": "T恤", "suit": "西装",
+        "gown": "长裙", "dress": "连衣裙",
+        "cloak": "斗篷",
         # 下装
-        "jean": "牛仔裤", "pants": "裤子",
-        # 配饰
-        "cowboy_hat": "牛仔帽", "punching_bag": "沙袋",
+        "jean": "牛仔裤", "pants": "裤子", "skirt": "裙子",
+        "swimming_trunks": "泳裤", "bikini": "比基尼",
+        # 鞋帽
+        "cowboy_hat": "牛仔帽", "sun_hat": "太阳帽", "baseball_cap": "棒球帽",
+        "shoe": "鞋", "sneaker": "运动鞋", "loafer": "乐福鞋",
+        "boot": "靴子", "sock": "袜子",
+        # 包袋
+        "purse": "手提包", "backpack": "背包", "handbag": "手提包",
+        # 面料/材质关键词（从类别名中提取）
+        "wool": "羊毛", "cashmere": "羊绒", "silk": "丝绸", "cotton": "棉",
+        "leather": "皮革", "fur": "毛皮", "velvet": "天鹅绒",
+    }
+
+    # 要过滤掉的 ImageNet 不相关类别
+    skip_labels = {
+        "punching_bag", "gasmask", "breastplate", "cuirass", "lab_coat",
+        "military_uniform", "cowboy_boot", "stethoscope", "turnstile",
+        "cash_machine", "washbasin", "coho", "oxygen_mask", "kimono",
     }
 
     # 通用关键词列表（用于直接从标签中提取）
@@ -832,8 +859,11 @@ def generate_product_summary(details: list, all_classes: list) -> str:
     summary_parts = []
     found_categories = set()
 
-    # 第一步：使用映射表转换 YOLO 类别
+    # 第一步：使用映射表转换 YOLO 类别（过滤掉不相关的）
     for label in all_labels:
+        # 跳过不相关的类别
+        if label in skip_labels:
+            continue
         if label in yolo_category_map:
             chinese = yolo_category_map[label]
             if chinese not in found_categories:
