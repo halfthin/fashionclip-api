@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     gosu \
     curl \
-    wget \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.10 /usr/local/bin/python3.10 \
     && ln -sf /usr/bin/python3.10 /usr/local/bin/python3 \
@@ -30,11 +29,6 @@ COPY --chown=appuser:appuser app.py /code/app.py
 COPY --chown=appuser:appuser entrypoint.sh /code/entrypoint.sh
 RUN chmod +x /code/entrypoint.sh
 
-# 预下载 YOLO 模型到缓存目录（使用 wget）
-RUN mkdir -p /code/cache/yolo && \
-    wget -q -O /code/cache/yolo/yolov8n-cls.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n-cls.pt || \
-    echo "YOLO model download skipped (will be downloaded at runtime)"
-
 # 创建缓存目录
 RUN mkdir -p /code/cache /home/appuser/.cache/huggingface && chown -R appuser:appuser /code /home/appuser/.cache
 
@@ -49,7 +43,6 @@ ENV FASHIONCLIP_RESIZE=true
 ENV FASHIONCLIP_MAX_DIM=672
 ENV FASHIONCLIP_QUALITY=85
 ENV HF_ENDPOINT=https://hf-mirror.com
-ENV YOLO_CONFIG_DIR=/code/cache/yolo
 
 EXPOSE 8008
 

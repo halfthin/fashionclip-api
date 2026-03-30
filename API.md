@@ -6,10 +6,7 @@
 
 - **服务地址**: `http://<host>:8008`
 - **向量维度**: 512 维 (FashionCLIP)
-- **模型**:
-  - FashionCLIP: `laion/CLIP-ViT-B-16-laion2B-s34B-b88K` (512 维向量)
-  - YOLOv8n-cls: 图像分类 (ImageNet-1k)
-  - Segformer B0: 细粒度语义分割
+- **模型**: FashionCLIP `laion/CLIP-ViT-B-16-laion2B-s34B-b88K` (512 维向量)
 - **向量数据库**: Qdrant
 
 ## API 列表
@@ -18,8 +15,6 @@
 |------|------|------|
 | GET | `/health` | 健康检查 |
 | POST | `/search` | 搜索相似图片 |
-| POST | `/analyze` | 综合图片分析（向量+分类+属性） |
-| POST | `/analyze/product` | 款式分析（支持文件夹/URL/Base64） |
 | POST | `/embed/scan` | 触发目录扫描（异步） |
 | POST | `/embed/batch` | 批量 embedding |
 | GET | `/embed/status` | 获取扫描状态 |
@@ -104,151 +99,7 @@ curl -X POST http://localhost:8008/search \
 
 ---
 
-## 3. 综合图片分析
-
-综合分析图片，生成 FashionCLIP 向量和多维度分类标签，用于替代阿里百炼的 multimodal embedding。
-
-### 请求
-
-```
-POST /analyze
-Content-Type: multipart/form-data
-```
-
-**参数 (Form Data):**
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `file` | File | 与 image_url 二选一 | 上传的图片文件 |
-| `image_url` | String | 与 file 二选一 | 图片 URL |
-
-### 示例
-
-```bash
-# 上传图片分析
-curl -X POST http://localhost:8008/analyze \
-  -F "file=@your_image.jpg"
-
-# URL 图片分析
-curl -X POST http://localhost:8008/analyze \
-  -F "image_url=https://example.com/image.jpg"
-```
-
-### 响应
-
-```json
-{
-  "embedding": [0.123, -0.456, ...],
-  "vector_size": 512,
-  "top_class": "jersey",
-  "yolo_labels": [
-    ["jersey", 0.8923],
-    ["cardigan", 0.0451],
-    ["sweatshirt", 0.0234],
-    ["bikini", 0.0123],
-    ["maillot", 0.0089]
-  ],
-  "detail_labels": [
-    [27, 0.1234],
-    [15, 0.0891],
-    [8, 0.0567],
-    [42, 0.0345],
-    [3, 0.0212]
-  ],
-  "combined_text": "jersey(0.89); cardigan(0.05); sweatshirt(0.02); 细粒度: segment_27, segment_15, segment_8, segment_42, segment_3",
-  "analyze_time_ms": 345.2
-}
-```
-
-**字段说明:**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `embedding` | float[512] | FashionCLIP 512 维归一化向量 |
-| `vector_size` | int | 向量维度 (512) |
-| `top_class` | string | YOLOv8n-cls 最高置信度分类 |
-| `yolo_labels` | array | YOLOv8n-cls top5 分类 [(类别名, 置信度), ...] |
-| `detail_labels` | array | Segformer B0 细粒度分割结果 [(类别索引, 比例), ...] |
-| `combined_text` | string | 合并后的文本描述 |
-| `analyze_time_ms` | float | 分析耗时 (毫秒) |
-
----
-
-## 4. 款式分析
-
-款式分析接口，支持多种图片输入格式，返回结构化的款式信息。
-
-### 请求
-
-```
-POST /analyze/product
-Content-Type: application/x-www-form-urlencoded
-```
-
-**参数 (Form Data):**
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `folder_path` | String | 与其他图片参数二选一 | 文件夹路径，扫描目录下所有图片 |
-| `image_urls` | String | 与其他图片参数二选一 | 图片 URL，多个用逗号分隔 |
-| `image_paths` | String | 与其他图片参数二选一 | 本地图片路径，多个用逗号分隔 |
-| `images_base64` | String | 与其他图片参数二选一 | Base64 图片，格式: `[{"Name":"xxx.jpg","data":"base64..."},...]` |
-
-### 示例
-
-```bash
-# 从文件夹分析
-curl -X POST http://localhost:8008/analyze/product \
-  -d "folder_path=/mnt/dapai-s/category/2024A001"
-
-# 从 URL 分析
-curl -X POST http://localhost:8008/analyze/product \
-  -d "image_urls=https://example.com/img1.jpg,https://example.com/img2.jpg"
-
-# 从本地路径分析
-curl -X POST http://localhost:8008/analyze/product \
-  -d "image_paths=/mnt/dapai-s/category/2024A001/main.jpg,/mnt/dapai-s/category/2024A001/detail1.jpg"
-```
-
-### 响应
-
-```json
-{
-  "prod_code": "2024A001",
-  "summary": "浅蓝色，牛仔裤，街头风，牛角扣，碎边 (2张图片)",
-  "detail": [
-    {
-      "filepath": "/mnt/dapai-s/category/2024A001/main.jpg",
-      "text": "jersey(0.89); 细粒度: segment_27, segment_15",
-      "top_class": "jersey"
-    },
-    {
-      "filepath": "/mnt/dapai-s/category/2024A001/detail1.jpg",
-      "text": "jersey(0.85); collar(0.12); 细粒度: segment_8",
-      "top_class": "jersey"
-    }
-  ],
-  "total_images": 2,
-  "process_time_ms": 1234.5
-}
-```
-
-**字段说明:**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `prod_code` | string | 从文件路径中提取的款号，可能为空 |
-| `summary` | string | 所有图片识别的汇总描述 |
-| `detail` | array | 每张图片的详细识别结果 |
-| `detail[].filepath` | string | 图片路径或名称 |
-| `detail[].text` | string | 该图片的识别文本描述 |
-| `detail[].top_class` | string | 该图片的 YOLOv8 最高置信度分类 |
-| `total_images` | int | 处理的图片总数 |
-| `process_time_ms` | float | 处理耗时 (毫秒) |
-
----
-
-## 5. 触发目录扫描
+## 3. 触发目录扫描
 
 扫描照片目录，生成所有图片的向量并存入 Qdrant。
 
@@ -288,7 +139,7 @@ curl -X POST http://localhost:8008/embed/scan \
 
 ---
 
-## 6. 批量 Embedding
+## 4. 批量 Embedding
 
 将多个图片文件批量转换为向量并存储。
 
@@ -326,7 +177,7 @@ curl -X POST http://localhost:8008/embed/batch \
 
 ---
 
-## 7. 获取扫描状态
+## 5. 获取扫描状态
 
 ### 请求
 
@@ -357,7 +208,7 @@ curl http://localhost:8008/embed/status
 
 ---
 
-## 8. 获取图片向量信息
+## 6. 获取图片向量信息
 
 根据图片路径查询其向量信息和元数据。
 
