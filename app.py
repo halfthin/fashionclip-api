@@ -126,7 +126,13 @@ def load_yolo_model():
     if yolo_model is None:
         from ultralytics import YOLO
         logger.info("正在加载 YOLOv8n-cls 模型...")
-        yolo_model = YOLO("yolov8n-cls.pt")
+        # 优先使用预下载的模型缓存
+        cache_path = "/code/cache/yolo/yolov8n-cls.pt"
+        import os
+        if os.path.exists(cache_path):
+            yolo_model = YOLO(cache_path)
+        else:
+            yolo_model = YOLO("yolov8n-cls.pt")
         if DEVICE == "cuda":
             yolo_model.to(DEVICE)
         logger.info("YOLOv8n-cls 模型加载完成")
