@@ -9,9 +9,10 @@ import logging
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import numpy as np
@@ -204,7 +205,7 @@ def preprocess_image(input_path: str) -> Image.Image:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=30,
+            timeout=60,
         )
         if result.returncode != 0:
             logger.warning(f"ffmpeg 压缩失败，fallback 到原图: {input_path}")
@@ -252,6 +253,29 @@ def get_image_embedding(image: Image.Image) -> List[float]:
     # 归一化
     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
     return image_features.cpu().numpy()[0].tolist()
+
+
+def get_image_embeddings_batch(images: List[Image.Image]) -> List[List[float]]:
+    """批量获取图片的 embedding 向量（GPU 友好）"""
+    if not images:
+        return []
+    m, preprocess_fn = load_fashionclip_model()
+    with torch.no_grad():
+        tensors = torch.stack([preprocess_fn(img) for img in images]).to(DEVICE)
+        image_features = m.encode_image(tensors)
+    # 归一化
+    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    return image_features.cpu().numpy().tolist()
+
+
+def preprocess_image_with_path(args: Tuple[str, str]) -> Tuple[str, Optional[Image.Image], str]:
+    """预处理单张图片（用于并行处理），返回 (路径, 图片, 错误信息)"""
+    path, error_msg = args
+    try:
+        image = preprocess_image(path)
+        return (path, image, "")
+    except Exception as e:
+        return (path, None, str(e))
 
 
 def image_to_rclone_url(local_path: str) -> str:
@@ -468,12 +492,18 @@ async def trigger_scan(force_refresh: bool = Form(False)):
 
             logger.info(f"开始扫描 {total} 张图片...")
 
-            # 批量处理
-            m, p = load_fashionclip_model()
+            # 批量处理 - 并行预处理 + 批量推理
+            load_fashionclip_model()
             points = []
+            max_workers = min(8, os.cpu_count() or 4)
+            i = 0
 
-            for i, img_info in enumerate(image_files):
-                try:
+            while i < total:
+                # 收集一批图片
+                batch_to_check = image_files[i:i + BATCH_SIZE]
+                batch_images = []
+
+                for img_info in batch_to_check:
                     # 检查是否已索引 (增量模式)
                     if not force_refresh:
                         try:
@@ -486,41 +516,66 @@ async def trigger_scan(force_refresh: bool = Form(False)):
                                 continue
                         except Exception:
                             pass
+                    batch_images.append(img_info)
 
-                    # 处理图片 (使用 ffmpeg 压缩)
-                    image = preprocess_image(img_info["path"])
-                    vector = get_image_embedding(image)
-                    image.close()
+                if not batch_images:
+                    i += len(batch_to_check)
+                    continue
 
-                    # 构建 Rclone URL
-                    rclone_url = image_to_rclone_url(img_info["path"])
+                # 并行预处理
+                images_data = []  # (img_info, image)
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(preprocess_image, img["path"]): img
+                        for img in batch_images
+                    }
+                    for future in as_completed(futures):
+                        img_info_item = futures[future]
+                        try:
+                            image = future.result()
+                            images_data.append((img_info_item, image))
+                        except Exception as e:
+                            logger.error(f"预处理失败 {img_info_item['path']}: {e}")
+                            scan_status["progress"]["failed"] += 1
 
-                    point = qdrant_models.PointStruct(
-                        id=img_info["path"],
-                        vector={"image": vector},
-                        payload={
-                            "path": img_info["path"],
-                            "rclone_url": rclone_url,
-                            "size": img_info["size"],
-                            "format": img_info["format"],
-                            "indexed_at": datetime.now().isoformat(),
-                        },
+                # 批量推理
+                if images_data:
+                    try:
+                        images = [img for _, img in images_data]
+                        vectors = get_image_embeddings_batch(images)
+                        for (img_info_item, image), vector in zip(images_data, vectors):
+                            image.close()
+                            rclone_url = image_to_rclone_url(img_info_item["path"])
+                            point = qdrant_models.PointStruct(
+                                id=img_info_item["path"],
+                                vector={"image": vector},
+                                payload={
+                                    "path": img_info_item["path"],
+                                    "rclone_url": rclone_url,
+                                    "size": img_info_item["size"],
+                                    "format": img_info_item["format"],
+                                    "indexed_at": datetime.now().isoformat(),
+                                },
+                            )
+                            points.append(point)
+                    except Exception as e:
+                        logger.error(f"批量推理失败: {e}")
+                        for (img_info_item, image) in images_data:
+                            image.close()
+                            scan_status["progress"]["failed"] += 1
+
+                    # 更新已处理计数
+                    scan_status["progress"]["processed"] += len(images_data)
+
+                # 批量提交
+                if len(points) >= BATCH_SIZE:
+                    qdrant_client.upsert(
+                        collection_name=QDRANT_COLLECTION,
+                        points=points,
                     )
-                    points.append(point)
+                    points = []
 
-                    # 批量提交
-                    if len(points) >= BATCH_SIZE:
-                        qdrant_client.upsert(
-                            collection_name=QDRANT_COLLECTION,
-                            points=points,
-                        )
-                        points = []
-
-                    scan_status["progress"]["processed"] = i + 1
-
-                except Exception as e:
-                    logger.error(f"处理图片失败 {img_info['path']}: {e}")
-                    scan_status["progress"]["failed"] += 1
+                i += BATCH_SIZE
 
             # 提交剩余点
             if points:
