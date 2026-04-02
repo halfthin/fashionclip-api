@@ -255,6 +255,11 @@ def get_image_embedding(image: Image.Image) -> List[float]:
     return image_features.cpu().numpy()[0].tolist()
 
 
+def path_to_point_id(path: str) -> str:
+    """将文件路径转换为 Qdrant 合法的 point ID（MD5 hash）"""
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()
+
+
 def get_image_embeddings_batch(images: List[Image.Image]) -> List[List[float]]:
     """批量获取图片的 embedding 向量（GPU 友好）"""
     if not images:
@@ -509,7 +514,7 @@ async def trigger_scan(force_refresh: bool = Form(False)):
                         try:
                             existing = qdrant_client.retrieve(
                                 collection_name=QDRANT_COLLECTION,
-                                ids=[img_info["path"]],
+                                ids=[path_to_point_id(img_info["path"])],
                             )
                             if existing:
                                 scan_status["progress"]["processed"] += 1
@@ -547,7 +552,7 @@ async def trigger_scan(force_refresh: bool = Form(False)):
                             image.close()
                             rclone_url = image_to_rclone_url(img_info_item["path"])
                             point = qdrant_models.PointStruct(
-                                id=img_info_item["path"],
+                                id=path_to_point_id(img_info_item["path"]),
                                 vector={"image": vector},
                                 payload={
                                     "path": img_info_item["path"],
@@ -701,7 +706,7 @@ async def get_image_embedding_info(image_path: str):
 
         results = qdrant_client.retrieve(
             collection_name=QDRANT_COLLECTION,
-            ids=[full_path],
+            ids=[path_to_point_id(full_path)],
         )
 
         if not results:
