@@ -5,8 +5,10 @@ FashionCLIP 图片相似度搜索 API 服务
 
 import hashlib
 import io
+import json
 import logging
 import os
+import signal
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,12 +64,68 @@ IMAGE_QUALITY = int(os.getenv("FASHIONCLIP_QUALITY", "85"))  # JPEG 质量
 model = None
 preprocess = None
 qdrant_client = None
+shutdown_requested = False
 scan_status = {
     "is_scanning": False,
     "progress": {"total": 0, "processed": 0, "failed": 0},
     "last_scan": None,
     "total_indexed": 0,
 }
+
+# ============ Checkpoint 配置 ============
+CHECKPOINT_DIR = "/code/.scan_checkpoints"
+CHECKPOINT_INTERVAL = 100  # 每处理 N 张图片保存一次 checkpoint
+
+
+def _get_checkpoint_file(scan_path: str) -> str:
+    """获取路径特定的 checkpoint 文件"""
+    # 将扫描路径转换为安全的文件名
+    safe_name = scan_path.replace("/", "_").strip("_") or "root"
+    return f"{CHECKPOINT_DIR}/{safe_name}.json"
+
+
+def save_checkpoint(scan_path: str, data: dict):
+    """保存扫描进度 checkpoint"""
+    try:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        with open(_get_checkpoint_file(scan_path), "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"保存 checkpoint 失败: {e}")
+
+
+def load_checkpoint(scan_path: str) -> Optional[dict]:
+    """加载扫描进度 checkpoint"""
+    checkpoint_file = _get_checkpoint_file(scan_path)
+    if os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"加载 checkpoint 失败: {e}")
+    return None
+
+
+def clear_checkpoint(scan_path: str):
+    """清除 checkpoint"""
+    checkpoint_file = _get_checkpoint_file(scan_path)
+    if os.path.exists(checkpoint_file):
+        try:
+            os.remove(checkpoint_file)
+        except Exception:
+            pass
+
+
+# ============ SIGTERM 信号处理 ============
+def handle_shutdown(signum, frame):
+    global shutdown_requested
+    shutdown_requested = True
+    logger.info("收到终止信号，将在当前批次完成后停止扫描...")
+
+
+# 注册信号处理器
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
 
 
 # ============ FastAPI 应用 ============
@@ -256,8 +314,9 @@ def get_image_embedding(image: Image.Image) -> List[float]:
 
 
 def path_to_point_id(path: str) -> str:
-    """将文件路径转换为 Qdrant 合法的 point ID（MD5 hash）"""
-    return hashlib.sha1(path.encode("utf-8")).hexdigest()
+    """将文件路径转换为 Qdrant 合法的 point ID（UUID）"""
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, path))
 
 
 def get_image_embeddings_batch(images: List[Image.Image]) -> List[List[float]]:
@@ -293,7 +352,7 @@ def image_to_rclone_url(local_path: str) -> str:
     return f"{RCLONE_BASE_URL.rstrip('/')}/{relative_path}"
 
 
-def scan_photos_directory() -> List[dict]:
+def scan_photos_directory(relative_path: str = "") -> List[dict]:
     """扫描照片目录，返回所有有效图片信息
 
     过滤规则：
@@ -303,9 +362,9 @@ def scan_photos_directory() -> List[dict]:
     - 不处理 .webp 格式
     - 同名不同后缀时，优先选择 .png > .jpeg > .jpg
     """
-    photos_path = Path(PHOTOS_DIR)
+    photos_path = Path(PHOTOS_DIR) / relative_path.strip("/") if relative_path else Path(PHOTOS_DIR)
     if not photos_path.exists():
-        raise ValueError(f"照片目录不存在: {PHOTOS_DIR}")
+        raise ValueError(f"照片目录不存在: {photos_path}")
 
     # 第一步：收集所有有效图片，按 base name 分组
     name_to_files: dict[str, list[dict]] = {}
@@ -429,9 +488,10 @@ async def search_similar(
 
     # 搜索 Qdrant
     try:
-        results = qdrant_client.search(
+        results = qdrant_client.query_points(
             collection_name=QDRANT_COLLECTION,
-            query_vector=("image", query_vector),
+            query=query_vector,
+            using="image",
             limit=top_k,
             score_threshold=threshold,
         )
@@ -441,7 +501,7 @@ async def search_similar(
 
     # 格式化结果
     search_results = []
-    for hit in results:
+    for hit in results.points:
         payload = hit.payload or {}
         search_results.append({
             "path": payload.get("path", ""),
@@ -462,12 +522,24 @@ async def search_similar(
 
 
 @app.post("/embed/scan")
-async def trigger_scan(force_refresh: bool = Form(False)):
+async def trigger_scan(path: str = Form(..., description="相对路径，如 '2026年/3月/0331'"),
+                      force_refresh: bool = Form(False)):
     """
     触发目录扫描 (异步)
+
+    - path: 相对路径，最终拼接为 /mnt/dapai-s/{path}，只支持相对路径
     - force_refresh: false = 增量, true = 全量重新处理
     """
-    global scan_status
+    global scan_status, shutdown_requested
+
+    # 验证路径：必须是相对路径，不能是绝对路径或包含 ..
+    if os.path.isabs(path) or path.startswith("."):
+        raise HTTPException(status_code=400, detail="只支持相对路径，不能以 / 或 . 开头")
+
+    # 构建完整扫描路径
+    scan_path = Path(PHOTOS_DIR) / path.strip("/")
+    if not scan_path.exists():
+        raise HTTPException(status_code=400, detail=f"目录不存在: {scan_path}")
 
     if scan_status["is_scanning"]:
         return {
@@ -480,20 +552,35 @@ async def trigger_scan(force_refresh: bool = Form(False)):
     import asyncio
 
     async def run_scan():
-        global scan_status
+        global scan_status, shutdown_requested
         scan_status["is_scanning"] = True
         scan_status["progress"] = {"total": 0, "processed": 0, "failed": 0}
+
+        # 用于 checkpoint 的计数器
+        processed_since_checkpoint = 0
 
         try:
             # 初始化 Qdrant
             init_qdrant()
 
             # 扫描目录
-            image_files = scan_photos_directory()
+            image_files = scan_photos_directory(path)
             total = len(image_files)
             scan_status["progress"]["total"] = total
             scan_status["progress"]["processed"] = 0
             scan_status["progress"]["failed"] = 0
+
+            # 尝试加载 checkpoint（仅在非 force_refresh 模式）
+            checkpoint = None
+            start_index = 0
+            if not force_refresh:
+                checkpoint = load_checkpoint(path)
+                if checkpoint and checkpoint.get("total") == total:
+                    start_index = checkpoint.get("last_index", 0) + 1
+                    scan_status["progress"]["processed"] = checkpoint.get("processed", 0)
+                    scan_status["progress"]["failed"] = checkpoint.get("failed", 0)
+                    processed_since_checkpoint = scan_status["progress"]["processed"] % CHECKPOINT_INTERVAL
+                    logger.info(f"从 checkpoint 恢复: index={start_index}, processed={scan_status['progress']['processed']}")
 
             logger.info(f"开始扫描 {total} 张图片...")
 
@@ -501,9 +588,14 @@ async def trigger_scan(force_refresh: bool = Form(False)):
             load_fashionclip_model()
             points = []
             max_workers = min(8, os.cpu_count() or 4)
-            i = 0
+            i = start_index
 
             while i < total:
+                # 检查是否收到停止信号
+                if shutdown_requested:
+                    logger.info(f"扫描被中断，已处理到第 {i} 张")
+                    break
+
                 # 收集一批图片
                 batch_to_check = image_files[i:i + BATCH_SIZE]
                 batch_images = []
@@ -518,6 +610,7 @@ async def trigger_scan(force_refresh: bool = Form(False)):
                             )
                             if existing:
                                 scan_status["progress"]["processed"] += 1
+                                processed_since_checkpoint += 1
                                 continue
                         except Exception:
                             pass
@@ -542,8 +635,10 @@ async def trigger_scan(force_refresh: bool = Form(False)):
                         except Exception as e:
                             logger.error(f"预处理失败 {img_info_item['path']}: {e}")
                             scan_status["progress"]["failed"] += 1
+                            processed_since_checkpoint += 1
 
                 # 批量推理
+                batch_points = []
                 if images_data:
                     try:
                         images = [img for _, img in images_data]
@@ -562,40 +657,94 @@ async def trigger_scan(force_refresh: bool = Form(False)):
                                     "indexed_at": datetime.now().isoformat(),
                                 },
                             )
-                            points.append(point)
+                            batch_points.append(point)
                     except Exception as e:
                         logger.error(f"批量推理失败: {e}")
                         for (img_info_item, image) in images_data:
                             image.close()
                             scan_status["progress"]["failed"] += 1
+                            processed_since_checkpoint += 1
 
-                    # 更新已处理计数
-                    scan_status["progress"]["processed"] += len(images_data)
+                # 批量提交 with 重试
+                if batch_points:
+                    success = False
+                    for attempt in range(3):
+                        try:
+                            qdrant_client.upsert(
+                                collection_name=QDRANT_COLLECTION,
+                                points=batch_points,
+                            )
+                            success = True
+                            break
+                        except Exception as e:
+                            if attempt < 2:
+                                logger.warning(f"Upsert 失败，重试 ({attempt + 1}/3): {e}")
+                                time.sleep(1 * (attempt + 1))
+                            else:
+                                logger.error(f"Upsert 失败 {len(batch_points)} 个点: {e}")
+                                scan_status["progress"]["failed"] += len(batch_points)
+                                processed_since_checkpoint += len(batch_points)
 
-                # 批量提交
-                if len(points) >= BATCH_SIZE:
-                    qdrant_client.upsert(
-                        collection_name=QDRANT_COLLECTION,
-                        points=points,
-                    )
-                    points = []
+                    if success:
+                        # 只有 upsert 成功才计入 processed
+                        scan_status["progress"]["processed"] += len(batch_points)
+                        processed_since_checkpoint += len(batch_points)
+                        points.extend(batch_points)
+
+                    # 定期保存 checkpoint
+                    if processed_since_checkpoint >= CHECKPOINT_INTERVAL:
+                        save_checkpoint(path, {
+                            "total": total,
+                            "last_index": i,
+                            "processed": scan_status["progress"]["processed"],
+                            "failed": scan_status["progress"]["failed"],
+                        })
+                        processed_since_checkpoint = 0
 
                 i += BATCH_SIZE
 
             # 提交剩余点
-            if points:
-                qdrant_client.upsert(
-                    collection_name=QDRANT_COLLECTION,
-                    points=points,
-                )
+            if points and not shutdown_requested:
+                for attempt in range(3):
+                    try:
+                        qdrant_client.upsert(
+                            collection_name=QDRANT_COLLECTION,
+                            points=points,
+                        )
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            logger.warning(f"Upsert 剩余点失败，重试 ({attempt + 1}/3): {e}")
+                            time.sleep(1 * (attempt + 1))
+                        else:
+                            logger.error(f"Upsert 剩余点失败: {e}")
+
+            # 清理 checkpoint（扫描完成或被中断时）
+            if shutdown_requested:
+                save_checkpoint(path, {
+                    "total": total,
+                    "last_index": i - 1,
+                    "processed": scan_status["progress"]["processed"],
+                    "failed": scan_status["progress"]["failed"],
+                })
+            else:
+                clear_checkpoint(path)
 
             scan_status["last_scan"] = datetime.now().isoformat()
             scan_status["total_indexed"] = scan_status["progress"]["processed"]
+            shutdown_requested = False
             logger.info(f"扫描完成: 成功 {scan_status['progress']['processed']}, 失败 {scan_status['progress']['failed']}")
 
         except Exception as e:
             logger.error(f"扫描任务失败: {e}")
             traceback.print_exc()
+            # 保存 checkpoint 以便恢复
+            save_checkpoint(path, {
+                "total": scan_status["progress"]["total"],
+                "last_index": max(0, i - 1),
+                "processed": scan_status["progress"]["processed"],
+                "failed": scan_status["progress"]["failed"],
+            })
         finally:
             scan_status["is_scanning"] = False
 
@@ -603,7 +752,7 @@ async def trigger_scan(force_refresh: bool = Form(False)):
 
     # 获取预估数量
     try:
-        estimated = len(scan_photos_directory())
+        estimated = len(scan_photos_directory(path))
     except Exception:
         estimated = 0
 
@@ -613,6 +762,16 @@ async def trigger_scan(force_refresh: bool = Form(False)):
         "message": "目录扫描任务已启动",
         "estimated_count": estimated,
     }
+
+
+@app.post("/embed/cancel")
+async def cancel_scan():
+    """取消正在运行的扫描任务"""
+    global shutdown_requested
+    if not scan_status["is_scanning"]:
+        return {"status": "no_scan_running", "message": "没有正在运行的扫描任务"}
+    shutdown_requested = True
+    return {"status": "cancel_requested", "message": "扫描将在当前批次完成后停止"}
 
 
 @app.post("/embed/batch")
