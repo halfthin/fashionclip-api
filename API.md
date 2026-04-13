@@ -505,6 +505,60 @@ except requests.exceptions.HTTPError as e:
 
 ---
 
+## Point ID 算法
+
+Qdrant 中的 Point ID 使用 **UUID v5** (RFC 4122) 基于文件路径生成，确保跨平台、跨语言去重一致性。
+
+### 算法实现
+
+**Python:**
+```python
+import uuid
+
+def path_to_point_id(path: str) -> str:
+    """将文件路径转换为 Qdrant 合法的 point ID（UUID）"""
+    NAMESPACE_DNS = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, path))
+```
+
+**TypeScript/JavaScript:**
+```typescript
+import { v5 as uuidv5 } from 'uuid';
+
+const NAMESPACE_DNS = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+function pathToPointId(path: string): string {
+  return uuidv5(path, NAMESPACE_DNS);
+}
+```
+
+### 路径约定
+
+- **入库时使用的路径**: 绝对路径（`/mnt/dapai-s/2026年/1月/xxx.jpg`）
+- **跨机器使用**: 如需在其他平台计算相同 Point ID，应使用与 `PHOTOS_DIR` 拼接后相同的绝对路径
+
+### 增量扫描去重
+
+扫描时使用增量模式（`force_refresh=false`）会自动跳过已索引的图片：
+1. 根据文件路径计算 Point ID
+2. 查询 Qdrant 是否已存在该 ID
+3. 若存在则跳过，不重复入库
+
+### 示例
+
+```python
+# Python
+point_id = path_to_point_id("/mnt/dapai-s/2026年/1月/0331/abc.jpg")
+# 结果: 例如 "a1b2c3d4-e5f6-..." (UUID 格式)
+```
+
+```typescript
+// TypeScript
+const pointId = pathToPointId("/mnt/dapai-s/2026年/1月/0331/abc.jpg");
+// 结果: 与 Python 相同
+```
+
+---
+
 ## 注意事项
 
 1. **图片格式**: 支持 JPEG、PNG 格式，不支持 WebP
