@@ -38,6 +38,7 @@ logger = logging.getLogger("fashionclip")
 
 # ============ 配置 ============
 PHOTOS_DIR = os.getenv("PHOTOS", "/mnt/dapai-s")
+WXWORK_MEDIA_DIR = "/mnt/wxwork-media"
 RCLONE_BASE_URL = os.getenv("RCLONE_BASE_URL", "http://192.168.0.10:8080")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "images")
@@ -352,17 +353,15 @@ def image_to_rclone_url(local_path: str) -> str:
     return f"{RCLONE_BASE_URL.rstrip('/')}/{relative_path}"
 
 
-def scan_photos_directory(relative_path: str = "") -> List[dict]:
+def scan_photos_directory(relative_path: str = "", root_dir: str = None) -> List[dict]:
     """扫描照片目录，返回所有有效图片信息
 
-    过滤规则：
-    - 跳过 ._ 开头、Thumbs.db 等系统文件
-    - 跳过包含 _thumb 等的缩略图
-    - 跳过小于 3KB 的文件
-    - 不处理 .webp 格式
-    - 同名不同后缀时，优先选择 .png > .jpeg > .jpg
+    - relative_path: 相对于 root_dir 的路径
+    - root_dir: 扫描根目录，默认使用 PHOTOS_DIR
     """
-    photos_path = Path(PHOTOS_DIR) / relative_path.strip("/") if relative_path else Path(PHOTOS_DIR)
+    if root_dir is None:
+        root_dir = PHOTOS_DIR
+    photos_path = Path(root_dir) / relative_path.strip("/") if relative_path else Path(root_dir)
     if not photos_path.exists():
         raise ValueError(f"照片目录不存在: {photos_path}")
 
@@ -503,13 +502,16 @@ async def search_similar(
     search_results = []
     for hit in results.points:
         payload = hit.payload or {}
-        search_results.append({
+        result_item = {
             "path": payload.get("path", ""),
-            "rclone_url": payload.get("rclone_url", ""),
             "score": round(hit.score, 4),
             "size": payload.get("size", 0),
             "format": payload.get("format", ""),
-        })
+        }
+        # wxwork-media 路径不返回 rclone_url
+        if not payload.get("path", "").startswith(WXWORK_MEDIA_DIR):
+            result_item["rclone_url"] = payload.get("rclone_url", "")
+        search_results.append(result_item)
 
     query_time_ms = round((time.time() - start_time) * 1000)
 
@@ -523,12 +525,14 @@ async def search_similar(
 
 @app.post("/embed/scan")
 async def trigger_scan(path: str = Form(..., description="相对路径，如 '2026年/3月/0331'"),
-                      force_refresh: bool = Form(False)):
+                      force_refresh: bool = Form(False),
+                      base_url: str = Form("dapai-s", description="扫描根目录: 'dapai-s' 或 'wxwork-media'")):
     """
     触发目录扫描 (异步)
 
-    - path: 相对路径，最终拼接为 /mnt/dapai-s/{path}，只支持相对路径
+    - path: 相对路径，最终拼接为 {base_dir}/{path}
     - force_refresh: false = 增量, true = 全量重新处理
+    - base_url: 'dapai-s' -> /mnt/dapai-s, 'wxwork-media' -> /mnt/wxwork-media
     """
     global scan_status, shutdown_requested
 
@@ -536,8 +540,14 @@ async def trigger_scan(path: str = Form(..., description="相对路径，如 '20
     if os.path.isabs(path) or path.startswith("."):
         raise HTTPException(status_code=400, detail="只支持相对路径，不能以 / 或 . 开头")
 
+    # 根据 base_url 确定扫描根目录
+    if base_url == "wxwork-media":
+        scan_root = WXWORK_MEDIA_DIR
+    else:
+        scan_root = PHOTOS_DIR
+
     # 构建完整扫描路径
-    scan_path = Path(PHOTOS_DIR) / path.strip("/")
+    scan_path = Path(scan_root) / path.strip("/")
     if not scan_path.exists():
         raise HTTPException(status_code=400, detail=f"目录不存在: {scan_path}")
 
@@ -564,7 +574,7 @@ async def trigger_scan(path: str = Form(..., description="相对路径，如 '20
             init_qdrant()
 
             # 扫描目录
-            image_files = scan_photos_directory(path)
+            image_files = scan_photos_directory(path, scan_root)
             total = len(image_files)
             scan_status["progress"]["total"] = total
             scan_status["progress"]["processed"] = 0
@@ -752,7 +762,7 @@ async def trigger_scan(path: str = Form(..., description="相对路径，如 '20
 
     # 获取预估数量
     try:
-        estimated = len(scan_photos_directory(path))
+        estimated = len(scan_photos_directory(path, scan_root))
     except Exception:
         estimated = 0
 

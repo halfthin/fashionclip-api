@@ -8,6 +8,7 @@ services:
       - "${HOST_PORT:-8008}:8008"
     volumes:
       - /mnt/dapai-s:/mnt/dapai-s:ro
+      - /mnt/wxwork-media:/mnt/wxwork-media:ro
       - ./data/models:/code/cache
     deploy:
       resources:
