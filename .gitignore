@@ -8,3 +8,10 @@ __pycache__/
 .DS_Store
 *.log
 cache/
+
+# Claude Code / MCP
+.claude/
+.omc/
+
+# Local models
+data/
