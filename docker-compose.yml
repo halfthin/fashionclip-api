@@ -1,6 +1,6 @@
 services:
   fashionclip-api:
-    image: halfthin/fashionclip:latest
+    image: halfthin/fashion:latest
     container_name: fashionclip-api
     restart: always
     env_file: .env.docker
