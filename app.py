@@ -62,7 +62,8 @@ def load_fashionclip_model():
     else:
         logger.info("从 HuggingFace 加载模型...")
         model, _, preprocess = open_clip.create_model_and_transforms(
-            model_name="laion/CLIP-ViT-B-16-laion2B-s34B-b88K",
+            model_name="ViT-B-16",
+            pretrained="laion2B-s34B-b88K",
         )
 
     model = model.to(DEVICE)
@@ -136,7 +137,18 @@ def get_embeddings_batch(images: List[Image.Image]) -> List[List[float]]:
 
 
 # ============ FastAPI 应用 ============
-app = FastAPI(title="FashionCLIP Embedding API")
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("FashionCLIP Embedding API 启动中...")
+    load_fashionclip_model()
+    logger.info("服务就绪")
+    yield
+
+
+app = FastAPI(title="FashionCLIP Embedding API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -176,6 +188,9 @@ async def embed(req: EmbedRequest):
 async def embed_batch(req: EmbedBatchRequest):
     """批量向量化。并行读取图片后一次 GPU 前向推理。"""
     load_fashionclip_model()
+
+    if not req.paths:
+        return {"embeddings": [], "errors": []}
 
     # 并行加载
     loaded: dict[str, Image.Image | None] = {}
@@ -220,12 +235,6 @@ async def health():
     }
 
 
-@app.on_event("startup")
-async def startup():
-    """启动时加载模型"""
-    logger.info("FashionCLIP Embedding API 启动中...")
-    load_fashionclip_model()
-    logger.info("服务就绪")
 
 
 if __name__ == "__main__":
