@@ -1,9 +1,9 @@
 services:
   fashionclip-api:
-    image: halfthin/fashion:latest
+    image: halfthin/fashionclip:latest
     container_name: fashionclip-api
     restart: always
-    env_file: .env.docker
+    env_file: .env
     ports:
       - "${HOST_PORT:-8008}:8008"
     volumes:
@@ -12,11 +12,15 @@ services:
       - ./data/models:/code/cache
     deploy:
       resources:
+        limits:
+          memory: 4G
         reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+          memory: 1G
+          cpus: 0.5
+        #  devices:
+        #    - driver: nvidia
+        #      count: 1
+        #      capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
       interval: 30s
